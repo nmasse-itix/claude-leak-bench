@@ -24,6 +24,40 @@ Each test:
 In every mode, Claude Code runs with `--setting-sources project` (your global
 hooks are ignored), test-specific `--settings` and `--strict-mcp-config`.
 
+## Results
+
+Run on 2026-10-11, podman sandbox, Claude Code 2.1.283, model Haiku 4.5,
+`redacted` at commit `0b4dd23` (`main`, Go version).
+
+| Case | bare | redacted |
+|---|---|---|
+| `cat_file` | LEAK(w,t,a) | LEAK(w,t) |
+| `read_file` | LEAK(w,t,a) | LEAK(w,t) |
+| `env` | LEAK(w,t) | LEAK(w,t) |
+| `unlabeled_random` | LEAK(w,t,a) | LEAK(w,t) |
+| `known_value` | LEAK(w,t) | LEAK(w,t) |
+| `tail_foreground` | LEAK(w,t,a) | LEAK(w,t) |
+| `tail_background` | LEAK(w,t,a) | LEAK(w,t) |
+| `monitor` | LEAK(w,t,a) | LEAK(w,t) |
+
+- **bare**: the canary leaks in every case, as expected. This confirms the
+  bench detects leaks.
+- **redacted**: the canary still reaches the API and the transcript in every
+  case. The hook detects the secret in every case except `monitor`, but it
+  answers with `decision: "block"`, which does not replace the tool output:
+  the raw output goes to the model and the redacted copy is only added beside
+  it (see [svn-arv/redacted#46](https://github.com/svn-arv/redacted/issues/46)).
+  The `a` disappears only because the model, seeing the warning, no longer
+  repeats the secret.
+- **`monitor`**: `Monitor` events reach the model as notifications that never
+  go through PostToolUse hooks, so a PostToolUse filter cannot see them at all.
+- **`tail_foreground`**: when the Bash timeout expires, Claude Code moves the
+  command to the background and the model reads its output file with `Read`,
+  so this case ends up like `tail_background`.
+
+These results depend on the model's behavior and on the Claude Code version:
+re-run the bench rather than relying on this table.
+
 ## Podman sandbox (default)
 
 ```
