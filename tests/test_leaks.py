@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from bench.cases import CASES
-from bench.runner import cleanup_transcript, run_claude
+from bench.runner import run_claude
 
 
 def _cell(leaks: dict[str, bool]) -> str:
@@ -13,13 +13,19 @@ def _cell(leaks: dict[str, bool]) -> str:
     return f"LEAK({where})" if where else "clean"
 
 
-def test_leak(subject, case_name, tmp_path, request, report_dir, record):
+def test_leak(subject, case_name, tmp_path, request, report_dir, record, sandbox):
     opt = request.config.getoption
     row = dict(subject=subject.name, case=case_name, report_dir=str(report_dir))
 
     if reason := subject.available():
         record(**row, cell="skip")
         pytest.skip(reason)
+
+    files = subject.files()
+    if sandbox.subject_dir:
+        where = {name: f"{sandbox.subject_dir}/{name}" for name in files}
+    else:
+        where = {name: str(path) for name, path in files.items()}
 
     run, scenario, why = None, None, ""
     for attempt in range(1, opt("attempts") + 1):
@@ -34,14 +40,14 @@ def test_leak(subject, case_name, tmp_path, request, report_dir, record):
             scenario.writer.start()
         try:
             run = run_claude(
-                scenario.prompt, cwd=project, settings=subject.settings(), model=opt("model"), env=scenario.env,
-                artifacts=report_dir / subject.name / case_name / f"attempt{attempt}",
+                scenario.prompt, sandbox=sandbox, project=project, settings=subject.settings(where),
+                subject_files=files, model=opt("model"), env=scenario.env,
+                artifacts=report_dir / sandbox.name / subject.name / case_name / f"attempt{attempt}",
+                keep_transcripts=opt("keep_transcripts"),
             )
         finally:
             if scenario.writer:
                 scenario.writer.stop()
-        if not opt("keep_transcripts"):
-            cleanup_transcript(run.session_id)
 
         ok, why = scenario.check(run)
         if ok:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import json
 import os
 import threading
 import zlib
@@ -57,6 +58,11 @@ class RecordingProxy:
     upstream: str = field(default_factory=lambda: os.environ.get("BENCH_UPSTREAM", DEFAULT_UPSTREAM))
     exchanges: list[Exchange] = field(default_factory=list)
     port: int = 0
+    host: str = "127.0.0.1"
+    # "oauth:<token>" or "apikey:<key>": replaces whatever credential the client
+    # sent, so the sandboxed client only ever holds a dummy one.
+    auth: str | None = None
+    record_file: str | None = None  # append each exchange as a JSON line
 
     def __post_init__(self) -> None:
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -91,6 +97,15 @@ class RecordingProxy:
         if self._thread:
             self._thread.join(10)
 
+    def _run_forever_main(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._loop.run_until_complete(self._startup())
+        print(f"listening on {self.host}:{self.port}", flush=True)
+        try:
+            self._loop.run_forever()
+        except KeyboardInterrupt:
+            pass
+
     def _run(self, ready: threading.Event) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -105,7 +120,7 @@ class RecordingProxy:
         app.router.add_route("*", "/{tail:.*}", self._handle)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, "127.0.0.1", self.port)
+        site = web.TCPSite(self._runner, self.host, self.port)
         await site.start()
         self.port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
 
@@ -122,8 +137,14 @@ class RecordingProxy:
                             _decode(body, request.headers.get("Content-Encoding", "")))
         with self._lock:
             self.exchanges.append(exchange)
+            if self.record_file:
+                with open(self.record_file, "a") as f:
+                    f.write(json.dumps({"method": exchange.method, "path": exchange.path,
+                                        "body": exchange.body}) + "\n")
 
         headers = {k: v for k, v in request.headers.items() if k.lower() not in _SKIP_REQUEST_HEADERS}
+        if self.auth:
+            headers = _inject_auth(headers, self.auth)
         url = self.upstream.rstrip("/") + request.path_qs
         async with self._session.request(request.method, url, headers=headers, data=body) as upstream:
             exchange.status = upstream.status
@@ -136,3 +157,28 @@ class RecordingProxy:
                 await response.write(chunk)
             await response.write_eof()
             return response
+
+
+def _inject_auth(headers: dict[str, str], auth: str) -> dict[str, str]:
+    kind, _, secret = auth.strip().partition(":")
+    out = {k: v for k, v in headers.items() if k.lower() not in ("authorization", "x-api-key")}
+    if kind == "oauth":
+        out["Authorization"] = f"Bearer {secret}"
+    elif kind == "apikey":
+        out["x-api-key"] = secret
+    else:
+        raise ValueError(f"unknown auth kind {kind!r}")
+    return out
+
+
+def main() -> None:
+    """Container entry point: listen on 0.0.0.0:8080, record to /records."""
+    auth_file = os.environ.get("BENCH_AUTH_FILE", "/run/secrets/bench-auth")
+    auth = open(auth_file).read() if os.path.exists(auth_file) else None
+    proxy = RecordingProxy(host="0.0.0.0", port=int(os.environ.get("BENCH_PORT", "8080")), auth=auth,
+                           record_file=os.environ.get("BENCH_RECORD_FILE", "/records/wire.jsonl"))
+    proxy._run_forever_main()
+
+
+if __name__ == "__main__":
+    main()

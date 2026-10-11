@@ -1,8 +1,13 @@
 """Subjects: the Claude Code configurations under test.
 
-A subject supplies the settings Claude Code runs with (typically a hook) and,
-optionally, a way to declare known secret values ahead of time. To test a new
-project, add a Subject here and register it in SUBJECTS.
+A subject supplies the files it needs (e.g. a hook binary), the settings Claude
+Code runs with (typically a hook) and, optionally, a way to declare known
+secret values ahead of time. To test a new project, add a Subject here and
+register it in SUBJECTS.
+
+Files are copied into the sandbox: `settings(where)` receives, for each
+`files()` name, the path the file is visible at (a container path under podman).
+Hook binaries must run in the sandbox image (Fedora minimal, glibc).
 """
 
 from __future__ import annotations
@@ -24,7 +29,10 @@ class Subject:
         """None when usable, else the reason to skip."""
         return None
 
-    def settings(self) -> dict:
+    def files(self) -> dict[str, Path]:
+        return {}
+
+    def settings(self, where: dict[str, str]) -> dict:
         return {}
 
     def declare_known(self, project: Path, values: list[str]) -> bool:
@@ -44,7 +52,8 @@ class Redacted(Subject):
     """github.com/svn-arv/redacted (Go, 0.x): a PostToolUse hook, `redacted scrub`.
 
     Known values are declared as a literal custom pattern in the project's
-    .redacted.engine.yml. The global ~/.config/redacted files still apply.
+    .redacted.engine.yml. In host mode the global ~/.config/redacted files
+    also apply; the podman sandbox has none.
     """
 
     def __init__(self, name: str = "redacted", binary: str | None = None) -> None:
@@ -56,8 +65,12 @@ class Redacted(Subject):
             return "redacted binary not found (set REDACTED_BIN)"
         return None
 
-    def settings(self) -> dict:
-        return {"hooks": {"PostToolUse": [{"hooks": [{"type": "command", "command": f"{self.binary} scrub"}]}]}}
+    def files(self) -> dict[str, Path]:
+        return {"redacted": Path(self.binary)}
+
+    def settings(self, where: dict[str, str]) -> dict:
+        cmd = f"{where['redacted']} scrub"
+        return {"hooks": {"PostToolUse": [{"hooks": [{"type": "command", "command": cmd}]}]}}
 
     def declare_known(self, project: Path, values: list[str]) -> bool:
         assert not any("\\E" in v or "'" in v for v in values), "value cannot be quoted literally"
