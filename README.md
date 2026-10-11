@@ -27,7 +27,7 @@ Each cell of the matrix shows the worst place reached:
 - 🟠 it was not sent to the API, but was written to the transcript on disk;
 - 🟢 neither.
 
-In every mode, Claude Code runs with `--setting-sources project` (your global
+Claude Code runs with `--setting-sources project` (your global
 hooks are ignored), test-specific `--settings` and `--strict-mcp-config`.
 
 ## Results
@@ -97,7 +97,7 @@ transcript on disk · 🟢 neither
 These results depend on the model's behavior and on the Claude Code version:
 re-run the bench rather than relying on this table.
 
-## Podman sandbox (default)
+## Podman sandbox
 
 ```
  ┌──────────── network leak-bench-internal (--internal, no egress) ─────────────┐
@@ -138,9 +138,9 @@ Credential used by the proxy, in this order: `BENCH_AUTH`
 expires in less than 30 min, the bench stops and asks you to run
 `claude -p hi` on the host.
 
-`--sandbox host` runs the host's `claude` instead, behind an in-process proxy
-and with an environment reduced to a fixed list of variables. Quicker to set
-up, but with no network or file isolation.
+Images are tagged with a hash of the files they are built from (Claude Code's
+version, the proxy's code, a sidecar's commit), so a change rebuilds them on
+the next run.
 
 ## Cases (`bench/cases.py`)
 
@@ -202,8 +202,7 @@ REDACTED_BIN=~/git/redacted/redacted uv run pytest --subject redacted
 REDACTED_PR47_BIN=~/git/redacted-pr47/target/release/redacted uv run pytest --subject redacted-pr47 --subject redacted-pr47-heuristic
 RDX_SRC=~/git/claude-code-redact uv run pytest --subject rdx-proxy
 uv run pytest --model claude-sonnet-5           # another model (default: Haiku 4.5)
-uv run pytest --claude-version 2.1.292          # another Claude Code version (podman)
-uv run pytest --sandbox host                    # no container
+uv run pytest --claude-version 2.1.292          # another Claude Code version
 ```
 
 Requirements: `uv`, rootless `podman`, `pgrep`; `claude` on the host to detect
@@ -211,10 +210,10 @@ the default version (or `--claude-version`).
 
 Options: `--attempts N` (retries when inconclusive, default 2),
 `--keep-transcripts` (keeps the container's `~/.claude` directory in the
-report; in host mode, leaves the sessions in `~/.claude/projects`).
+report).
 
 At the end of a run, a case × subject matrix is printed. It is written, along
-with all the evidence, to `reports/<timestamp>/<sandbox>/`: `stream.jsonl`,
+with all the evidence, to `reports/<timestamp>/<subject>/<case>/`: `stream.jsonl`,
 `wire.txt` (request bodies), `transcript.jsonl`, `settings.json` and, for an
 interceptor, `interceptor.log`.
 
@@ -222,13 +221,8 @@ interceptor, `interceptor.log`.
 
 - **Cost**: one `claude -p` run per case and per subject. The `tail` cases take
   about 30 to 60 s each.
-- **`reports/` contains the full system prompt** sent to the API. In host mode,
-  it includes your user context (email…). The directory is git-ignored; do not
-  publish it as is.
-- In podman mode, only traffic to `ANTHROPIC_BASE_URL` can get out; the rest
+- **`reports/` contains the full system prompt** sent to the API. The
+  directory is git-ignored; do not publish it as is.
+- Only traffic to `ANTHROPIC_BASE_URL` can get out; the rest
   (telemetry…) is blocked. The bench therefore measures what Claude Code sends
   to the API, not what it would try to send elsewhere.
-- In host mode, the rest of the traffic is neither blocked nor recorded, and a
-  filter may read its global config (`~/.config/redacted/…`). The `rdx-proxy`
-  interceptor runs from its checkout with `uv run`, which creates a `.venv`
-  there.

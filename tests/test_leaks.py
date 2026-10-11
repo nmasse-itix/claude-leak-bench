@@ -23,10 +23,7 @@ def test_leak(subject, case_name, tmp_path, request, report_dir, record, sandbox
         pytest.skip(reason)
 
     files = subject.files()
-    if sandbox.subject_dir:
-        where = {name: f"{sandbox.subject_dir}/{name}" for name in files}
-    else:
-        where = {name: str(path) for name, path in files.items()}
+    where = {name: f"{sandbox.subject_dir}/{name}" for name in files}
 
     run, scenario, why = None, None, ""
     for attempt in range(1, opt("attempts") + 1):
@@ -44,7 +41,7 @@ def test_leak(subject, case_name, tmp_path, request, report_dir, record, sandbox
             run = run_claude(
                 scenario.prompt, sandbox=sandbox, project=project, settings=subject.settings(where),
                 subject_files=files, model=opt("model"), env=scenario.env,
-                artifacts=report_dir / sandbox.name / subject.name / case_name / f"attempt{attempt}",
+                artifacts=report_dir / subject.name / case_name / f"attempt{attempt}",
                 keep_transcripts=opt("keep_transcripts"), interceptor=subject.interceptor(),
             )
         finally:

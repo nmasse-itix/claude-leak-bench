@@ -11,8 +11,7 @@ A name may contain `/` to lay out a directory tree.
 Hook binaries must run in the sandbox image (Fedora minimal, glibc).
 
 A subject that is not a hook (e.g. a redacting API proxy) runs as a sidecar:
-an image built from its checkout under podman, a command from that checkout on
-the host. `prepare()` may run it once in the project (setup steps), and
+a container whose image is built from its checkout. `prepare()` may run it once in the project (setup steps), and
 `interceptor()` inserts it between Claude Code and the recording proxy.
 """
 
@@ -35,9 +34,8 @@ RunSidecar = Callable[["Sidecar", list[str]], None]
 class Sidecar:
     """A program the subject runs next to Claude Code, from a local checkout."""
     name: str            # podman image: leak-bench-<name>:<tag>
-    checkout: Path       # build context under podman, project for `host_cmd` on the host
+    checkout: Path       # build context
     containerfile: str   # in containers/
-    host_cmd: list[str]  # prefix that runs a command from the checkout on the host
 
     @property
     def tag(self) -> str:
@@ -53,7 +51,7 @@ class Sidecar:
 class Interceptor:
     """A sidecar proxy between Claude Code and the recording proxy."""
     sidecar: Sidecar
-    argv: list[str]      # `{host}` and `{port}` are filled in by the sandbox
+    argv: list[str]      # must listen on 0.0.0.0:8080
     upstream_env: str    # env var that receives the recording proxy's base URL
     ready: str           # log line printed once it listens
 
@@ -100,8 +98,8 @@ class Redacted(Subject):
     `redacted` is the Go version (0.x, `main`), `redacted-pr47` the Rust
     rewrite of svn-arv/redacted#47 (1.0.0). Known values are declared as a
     literal custom pattern in the project's .redacted.engine.yml, which both
-    versions read. In host mode the global ~/.config/redacted files also
-    apply; the podman sandbox has none, so 1.0.0 runs without learned secrets.
+    versions read. The sandbox has no global ~/.config/redacted, so 1.0.0 runs
+    without learned secrets.
     """
 
     def __init__(self, name: str = "redacted", env_var: str = "REDACTED_BIN", which: bool = True) -> None:
@@ -177,8 +175,7 @@ class RdxProxy(Subject):
     def __init__(self) -> None:
         super().__init__("rdx-proxy")
         src = os.environ.get("RDX_SRC")
-        self.sidecar = Sidecar("rdx", Path(src).expanduser() if src else Path(), "rdx.Containerfile",
-                               ["uv", "run", "--quiet", "--project", src or ""])
+        self.sidecar = Sidecar("rdx", Path(src).expanduser() if src else Path(), "rdx.Containerfile")
 
     def available(self) -> str | None:
         if not os.environ.get("RDX_SRC") or not (self.sidecar.checkout / "src/rdx").is_dir():
@@ -200,7 +197,7 @@ class RdxProxy(Subject):
 
     def interceptor(self) -> Interceptor:
         return Interceptor(self.sidecar,
-                           ["python", "-m", "uvicorn", "rdx.proxy.server:app", "--host", "{host}", "--port", "{port}"],
+                           ["python", "-m", "uvicorn", "rdx.proxy.server:app", "--host", "0.0.0.0", "--port", "8080"],
                            upstream_env="RDX_UPSTREAM_URL", ready="Uvicorn running")
 
 

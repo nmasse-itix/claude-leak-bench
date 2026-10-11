@@ -25,12 +25,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     g.addoption("--attempts", type=int, default=2,
                 help="retries when the model does not exercise the scenario (inconclusive run)")
     g.addoption("--keep-transcripts", action="store_true",
-                help="keep the session transcripts: in ~/.claude/projects (host) or in the report (podman)")
-    g.addoption("--sandbox", choices=["podman", "host"], default="podman",
-                help="podman: rootless container, no egress but the recording proxy (default). "
-                     "host: run the host's claude directly")
+                help="keep the container's ~/.claude directory in the report")
     g.addoption("--claude-version", default=None,
-                help="Claude Code version for the podman image (default: the host's `claude --version`)")
+                help="Claude Code version for the sandbox image (default: the host's `claude --version`)")
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
@@ -49,22 +46,19 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
 @pytest.fixture(scope="session")
 def sandbox(request):
-    from bench.runner import HostSandbox, PodmanSandbox
+    from bench.runner import Sandbox
 
-    if request.config.getoption("sandbox") == "host":
-        sb = HostSandbox()
-    else:
-        version = request.config.getoption("claude_version")
-        if not version:
-            out = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout
-            m = re.search(r"\d+\.\d+\.\d+", out)
-            if not m:
-                raise pytest.UsageError("cannot detect the host Claude Code version: pass --claude-version")
-            version = m.group(0)
-        try:
-            sb = PodmanSandbox(version)
-        except RuntimeError as e:
-            pytest.exit(str(e), returncode=2)
+    version = request.config.getoption("claude_version")
+    if not version:
+        out = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout
+        m = re.search(r"\d+\.\d+\.\d+", out)
+        if not m:
+            raise pytest.UsageError("cannot detect the host Claude Code version: pass --claude-version")
+        version = m.group(0)
+    try:
+        sb = Sandbox(version)
+    except RuntimeError as e:
+        pytest.exit(str(e), returncode=2)
     yield sb
     sb.close()
 
