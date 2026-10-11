@@ -9,8 +9,9 @@ from bench.runner import run_claude
 
 
 def _cell(leaks: dict[str, bool]) -> str:
-    where = ",".join(k[0] for k, v in leaks.items() if v)
-    return f"LEAK({where})" if where else "clean"
+    if leaks["wire"]:
+        return "🔴"
+    return "🟠" if leaks["transcript"] else "🟢"
 
 
 def test_leak(subject, case_name, tmp_path, request, report_dir, record, sandbox):

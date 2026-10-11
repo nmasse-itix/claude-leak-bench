@@ -93,9 +93,9 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
     lines = ["| case | " + " | ".join(subjects) + " |", "|---" * (len(subjects) + 1) + "|"]
     for c in cases:
         lines.append(f"| {c} | " + " | ".join(cell.get((s, c), "") for s in subjects) + " |")
-    legend = ("LEAK(w,t,a) = canary found on the wire (sent to the API), in the transcript on disk, "
-              "in the final answer. clean = found nowhere. ? = inconclusive (scenario not exercised). "
-              "n/a = subject cannot declare known values.")
+    legend = ("🔴 = canary sent to the Anthropic API. 🟠 = not sent to the API, but written to the "
+              "transcript on disk. 🟢 = neither. ? = inconclusive (scenario not exercised). "
+              "n/a = subject cannot declare known values. skip = subject not available.")
 
     terminalreporter.write_sep("=", "leak matrix")
     for line in lines:

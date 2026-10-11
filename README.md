@@ -12,14 +12,20 @@ Each test:
 2. runs `claude -p` behind a **local proxy that records everything sent to the
    API** (`ANTHROPIC_BASE_URL`);
 3. checks in the `stream-json` output that the model really performed the
-   requested action. If not, the result is **inconclusive** (skip), never "clean";
+   requested action. If not, the result is **inconclusive** (skip), never 🟢;
 4. looks for the canary in three places:
 
-| Letter | Where | What it proves |
-|---|---|---|
-| `w` | traffic to the API | the secret was sent to Anthropic: this is the reference |
-| `t` | transcript `~/.claude/projects/…/<session>.jsonl` | the secret was written to disk |
-| `a` | the model's final answer | informative only |
+| Where | What it proves |
+|---|---|
+| traffic to the API | the secret was sent to Anthropic: this is the reference |
+| transcript `~/.claude/projects/…/<session>.jsonl` | the secret was written to disk |
+| the model's final answer | informative only (`results.json`) |
+
+Each cell of the matrix shows the worst place reached:
+
+- 🔴 the secret was sent to the Anthropic API;
+- 🟠 it was not sent to the API, but was written to the transcript on disk;
+- 🟢 neither.
 
 In every mode, Claude Code runs with `--setting-sources project` (your global
 hooks are ignored), test-specific `--settings` and `--strict-mcp-config`.
@@ -27,18 +33,24 @@ hooks are ignored), test-specific `--settings` and `--strict-mcp-config`.
 ## Results
 
 Run on 2026-10-11, podman sandbox, Claude Code 2.1.283, model Haiku 4.5,
-`redacted` at commit `0b4dd23` (`main`, Go version).
+`redacted` at commit `0b4dd23` (`main`, Go version), `redacted-pr47` at
+commit `b88d507` ([svn-arv/redacted#47](https://github.com/svn-arv/redacted/pull/47),
+Rust rewrite 1.0.0), as is and with the entropy heuristic on
+(`redacted-pr47-heuristic`).
 
-| Case | bare | redacted |
-|---|---|---|
-| `cat_file` | LEAK(w,t,a) | LEAK(w,t) |
-| `read_file` | LEAK(w,t,a) | LEAK(w,t) |
-| `env` | LEAK(w,t) | LEAK(w,t) |
-| `unlabeled_random` | LEAK(w,t,a) | LEAK(w,t) |
-| `known_value` | LEAK(w,t) | LEAK(w,t) |
-| `tail_foreground` | LEAK(w,t,a) | LEAK(w,t) |
-| `tail_background` | LEAK(w,t,a) | LEAK(w,t) |
-| `monitor` | LEAK(w,t,a) | LEAK(w,t) |
+| Case | bare | redacted | redacted-pr47 | redacted-pr47-heuristic |
+|---|---|---|---|---|
+| `cat_file` | 🔴 | 🔴 | 🟢 | 🟢 |
+| `read_file` | 🔴 | 🔴 | 🟢 | 🟢 |
+| `env` | 🔴 | 🔴 | 🟢 | 🟢 |
+| `unlabeled_random` | 🔴 | 🔴 | 🔴 | 🟢 |
+| `known_value` | 🔴 | 🔴 | 🟢 | 🟢 |
+| `tail_foreground` | 🔴 | 🔴 | 🟢 | 🟢 |
+| `tail_background` | 🔴 | 🔴 | 🟢 | 🟢 |
+| `monitor` | 🔴 | 🔴 | 🔴 | 🔴 |
+
+🔴 sent to the Anthropic API · 🟠 not sent to the API, but written to the
+transcript on disk · 🟢 neither
 
 - **bare**: the canary leaks in every case, as expected. This confirms the
   bench detects leaks.
@@ -47,8 +59,17 @@ Run on 2026-10-11, podman sandbox, Claude Code 2.1.283, model Haiku 4.5,
   answers with `decision: "block"`, which does not replace the tool output:
   the raw output goes to the model and the redacted copy is only added beside
   it (see [svn-arv/redacted#46](https://github.com/svn-arv/redacted/issues/46)).
-  The `a` disappears only because the model, seeing the warning, no longer
-  repeats the secret.
+  The model, seeing the warning, merely stops repeating the secret in its
+  answer.
+- **redacted-pr47**: `updatedToolOutput` now mirrors the shape of the tool
+  response, so Claude Code applies the replacement: the model and the
+  transcript only see the marker (`DB_PASSWORD= [REDACTED ...grtZ]`, last 4
+  characters kept). `unlabeled_random` leaks because nothing flags a random
+  value under a neutral key: in 1.0.0 that takes a secret learned by
+  `redacted init` (global config, absent from the sandbox) or the entropy
+  heuristic (off by default).
+- **redacted-pr47-heuristic**: with the heuristic on, `unlabeled_random` is
+  caught too (`cache_ref: [REDACTED ...B95I]`, pattern `secret_value`).
 - **`monitor`**: `Monitor` events reach the model as notifications that never
   go through PostToolUse hooks, so a PostToolUse filter cannot see them at all.
 - **`tail_foreground`**: when the Bash timeout expires, Claude Code moves the
@@ -122,6 +143,14 @@ one.
 - `redacted`: [svn-arv/redacted](https://github.com/svn-arv/redacted) as a
   PostToolUse hook. Binary from `REDACTED_BIN` or the `PATH`. The test passes
   when nothing leaks (neither `w` nor `t`).
+- `redacted-pr47`: the same, built from
+  [svn-arv/redacted#47](https://github.com/svn-arv/redacted/pull/47) (Rust
+  rewrite). Binary from `REDACTED_PR47_BIN` only. The sandbox has no global
+  `~/.config/redacted`, so it runs without learned secrets or heuristic:
+  vendor signatures and project `.redacted.engine.yml` patterns only.
+- `redacted-pr47-heuristic`: the same binary with `heuristic.enabled: true`.
+  The heuristic is read from the global config only, so the hook runs with a
+  `HOME` of its own holding `.config/redacted/config.yaml`.
 
 To test another project, add a `Subject` subclass that provides `files()`
 (binaries copied into the sandbox), `settings(where)` (the hooks, given each
@@ -135,6 +164,7 @@ register it in `SUBJECTS`. A hook binary must be able to run on Fedora minimal
 uv run pytest                                   # everything
 uv run pytest --subject bare --case monitor     # a single case
 REDACTED_BIN=~/git/redacted/redacted uv run pytest --subject redacted
+REDACTED_PR47_BIN=~/git/redacted-pr47/target/release/redacted uv run pytest --subject redacted-pr47 --subject redacted-pr47-heuristic
 uv run pytest --model claude-sonnet-5           # another model (default: Haiku 4.5)
 uv run pytest --claude-version 2.1.292          # another Claude Code version (podman)
 uv run pytest --sandbox host                    # no container

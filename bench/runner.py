@@ -220,6 +220,7 @@ class PodmanSandbox:
             d.mkdir()
         (config / ".claude.json").write_text(json.dumps(self.feature_cache))
         for name, src in subject_files.items():
+            (staged / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, staged / name)
         (staged / "settings.json").write_text(json.dumps(settings, indent=2))
         shutil.copy2(staged / "settings.json", artifacts / "settings.json")
