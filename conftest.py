@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import pytest
+
+from bench.cases import CASES
+from bench.subjects import SUBJECTS
+
+ROOT = Path(__file__).parent
+RESULTS: list[dict] = []
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    g = parser.getgroup("leak bench")
+    g.addoption("--subject", action="append", default=[],
+                help=f"subject to test, repeatable (default: all). Known: {', '.join(SUBJECTS)}")
+    g.addoption("--case", action="append", default=[],
+                help=f"case to run, repeatable (default: all). Known: {', '.join(CASES)}")
+    g.addoption("--model", default="claude-haiku-4-5-20251001", help="model for the Claude Code runs")
+    g.addoption("--attempts", type=int, default=2,
+                help="retries when the model does not exercise the scenario (inconclusive run)")
+    g.addoption("--keep-transcripts", action="store_true",
+                help="leave the session transcripts in ~/.claude/projects (they are copied to the report anyway)")
+
+
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    if {"subject", "case_name"} <= set(metafunc.fixturenames):
+        subjects = metafunc.config.getoption("subject") or list(SUBJECTS)
+        cases = metafunc.config.getoption("case") or list(CASES)
+        unknown = [s for s in subjects if s not in SUBJECTS] + [c for c in cases if c not in CASES]
+        if unknown:
+            raise pytest.UsageError(f"unknown subject/case: {', '.join(unknown)}")
+        metafunc.parametrize(
+            "subject,case_name",
+            [(SUBJECTS[s], c) for s in subjects for c in cases],
+            ids=[f"{s}-{c}" for s in subjects for c in cases],
+        )
+
+
+@pytest.fixture(scope="session")
+def report_dir() -> Path:
+    d = ROOT / "reports" / time.strftime("%Y%m%d-%H%M%S")
+    d.mkdir(parents=True)
+    return d
+
+
+@pytest.fixture
+def record():
+    def _record(**row):
+        RESULTS.append(row)
+    return _record
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    if not RESULTS:
+        return
+    subjects = list(dict.fromkeys(r["subject"] for r in RESULTS))
+    cases = list(dict.fromkeys(r["case"] for r in RESULTS))
+    cell = {(r["subject"], r["case"]): r["cell"] for r in RESULTS}
+
+    lines = ["| case | " + " | ".join(subjects) + " |", "|---" * (len(subjects) + 1) + "|"]
+    for c in cases:
+        lines.append(f"| {c} | " + " | ".join(cell.get((s, c), "") for s in subjects) + " |")
+    legend = ("LEAK(w,t,a) = canary found on the wire (sent to the API), in the transcript on disk, "
+              "in the final answer. clean = found nowhere. ? = inconclusive (scenario not exercised). "
+              "n/a = subject cannot declare known values.")
+
+    terminalreporter.write_sep("=", "leak matrix")
+    for line in lines:
+        terminalreporter.write_line(line)
+    terminalreporter.write_line(legend)
+
+    out = Path(RESULTS[0]["report_dir"])
+    (out / "matrix.md").write_text("\n".join(lines) + "\n\n" + legend + "\n")
+    (out / "results.json").write_text(json.dumps(RESULTS, indent=2))
+    terminalreporter.write_line(f"report: {out}")
