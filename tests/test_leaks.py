@@ -36,6 +36,7 @@ def test_leak(subject, case_name, tmp_path, request, report_dir, record, sandbox
         if scenario.known and not subject.declare_known(project, [scenario.secret]):
             record(**row, cell="n/a")
             pytest.skip(f"{subject.name} cannot declare known values")
+        subject.prepare(project, lambda sidecar, argv: sandbox.exec(sidecar, argv, project))
 
         if scenario.writer:
             scenario.writer.start()
@@ -44,7 +45,7 @@ def test_leak(subject, case_name, tmp_path, request, report_dir, record, sandbox
                 scenario.prompt, sandbox=sandbox, project=project, settings=subject.settings(where),
                 subject_files=files, model=opt("model"), env=scenario.env,
                 artifacts=report_dir / sandbox.name / subject.name / case_name / f"attempt{attempt}",
-                keep_transcripts=opt("keep_transcripts"),
+                keep_transcripts=opt("keep_transcripts"), interceptor=subject.interceptor(),
             )
         finally:
             if scenario.writer:

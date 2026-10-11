@@ -36,18 +36,20 @@ Run on 2026-10-11, podman sandbox, Claude Code 2.1.283, model Haiku 4.5,
 `redacted` at commit `0b4dd23` (`main`, Go version), `redacted-pr47` at
 commit `b88d507` ([svn-arv/redacted#47](https://github.com/svn-arv/redacted/pull/47),
 Rust rewrite 1.0.0), as is and with the entropy heuristic on
-(`redacted-pr47-heuristic`).
+(`redacted-pr47-heuristic`). `rdx-proxy`:
+[paroque28/claude-code-redact](https://github.com/paroque28/claude-code-redact)
+at `d9c57fa` plus two local fixes (see below), 3 runs, one dot per run.
 
-| Case | bare | redacted | redacted-pr47 | redacted-pr47-heuristic |
-|---|---|---|---|---|
-| `cat_file` | 🔴 | 🔴 | 🟢 | 🟢 |
-| `read_file` | 🔴 | 🔴 | 🟢 | 🟢 |
-| `env` | 🔴 | 🔴 | 🟢 | 🟢 |
-| `unlabeled_random` | 🔴 | 🔴 | 🔴 | 🟢 |
-| `known_value` | 🔴 | 🔴 | 🟢 | 🟢 |
-| `tail_foreground` | 🔴 | 🔴 | 🟢 | 🟢 |
-| `tail_background` | 🔴 | 🔴 | 🟢 | 🟢 |
-| `monitor` | 🔴 | 🔴 | 🔴 | 🔴 |
+| Case | bare | redacted | redacted-pr47 | redacted-pr47-heuristic | rdx-proxy |
+|---|---|---|---|---|---|
+| `cat_file` | 🔴 | 🔴 | 🟢 | 🟢 | 🟠🔴🟠 |
+| `read_file` | 🔴 | 🔴 | 🟢 | 🟢 | 🔴🟠🔴 |
+| `env` | 🔴 | 🔴 | 🟢 | 🟢 | 🟠🔴🟠 |
+| `unlabeled_random` | 🔴 | 🔴 | 🔴 | 🟢 | 🔴🔴🔴 |
+| `known_value` | 🔴 | 🔴 | 🟢 | 🟢 | 🟠🟠🟠 |
+| `tail_foreground` | 🔴 | 🔴 | 🟢 | 🟢 | 🟠🔴🟠 |
+| `tail_background` | 🔴 | 🔴 | 🟢 | 🟢 | 🟠🟠🟠 |
+| `monitor` | 🔴 | 🔴 | 🔴 | 🔴 | 🟠🔴🔴 |
 
 🔴 sent to the Anthropic API · 🟠 not sent to the API, but written to the
 transcript on disk · 🟢 neither
@@ -70,8 +72,24 @@ transcript on disk · 🟢 neither
   heuristic (off by default).
 - **redacted-pr47-heuristic**: with the heuristic on, `unlabeled_random` is
   caught too (`cache_ref: [REDACTED ...B95I]`, pattern `secret_value`).
+- **rdx-proxy**: as an API proxy, it sees everything sent to the API,
+  `Monitor` notifications included, but the transcript always keeps the
+  secret, so 🟠 is its best result. Apart from the declared `known_value`,
+  only its entropy detector catches the canaries: Shannon entropy of at least
+  4.5 bits per character, on a value after `=` or in quotes. A random
+  32-character value stays under that threshold about one time in three
+  (68/200 in a direct test of its redactor), and every 🔴 above is a canary
+  under 4.5 bits, every 🟠 one at 4.5 or more. `unlabeled_random`
+  (`cache_ref: <value>`) matches no detector. Its context detector only knows
+  quoted values and `export` lines.
+  At `d9c57fa`, the proxy answers 500 to every request of a project with
+  `.redaction_rules` (a `NameError` on `_cache` since `b6c4606`), so Claude
+  Code cannot work at all, and its streaming responses are cut off because the
+  HTTP client is closed before the stream is read. The bench ran a local
+  branch with both fixed (`_cache` → `cache`, a client owned by the stream).
 - **`monitor`**: `Monitor` events reach the model as notifications that never
   go through PostToolUse hooks, so a PostToolUse filter cannot see them at all.
+  Only an API proxy such as `rdx-proxy` can catch them.
 - **`tail_foreground`**: when the Bash timeout expires, Claude Code moves the
   command to the background and the model reads its output file with `Read`,
   so this case ends up like `tail_background`.
@@ -98,6 +116,11 @@ re-run the bench rather than relying on this table.
 - **No real credential in the Claude Code container**, so the `env` case cannot
   expose it. The proxy gets the real one, mounted read-only from a temporary
   file in memory-backed storage (`$XDG_RUNTIME_DIR`).
+- **Interceptor**: a subject that is a redacting API proxy (`rdx-proxy`) runs
+  in a third container on the internal network, between Claude Code and the
+  recording proxy, with the same hardening. Its image is built from the
+  subject's checkout and tagged with its commit. The project is mounted
+  read-only at the same path (`/work`) as in the Claude Code container.
 - **No network egress** except through the proxy: any traffic that bypasses
   it fails instead of going unnoticed.
 - The container's `~/.claude` is a throwaway directory: your `~/.claude` is
@@ -152,11 +175,23 @@ one.
   The heuristic is read from the global config only, so the hook runs with a
   `HOME` of its own holding `.config/redacted/config.yaml`.
 
+- `rdx-proxy`: [paroque28/claude-code-redact](https://github.com/paroque28/claude-code-redact)
+  in proxy mode, its recommended mode. Checkout from `RDX_SRC`. It redacts
+  requests on their way to the API and puts the real values back in the
+  responses, so the transcript on disk always holds the secret: its best
+  possible result is 🟠. rdx redacts nothing for a project without
+  `.redaction_rules`, so the subject writes an empty one (built-in detectors
+  only), then performs the file steps of `rdx setup --proxy` with rdx's own
+  code (deny permissions in `.claude/settings.json`, `RDX.md`, `CLAUDE.md`).
+
 To test another project, add a `Subject` subclass that provides `files()`
 (binaries copied into the sandbox), `settings(where)` (the hooks, given each
 file's path inside the sandbox) and, if possible, `declare_known()`, then
 register it in `SUBJECTS`. A hook binary must be able to run on Fedora minimal
-(glibc; a static binary is ideal).
+(glibc; a static binary is ideal). A subject that is not a hook provides a
+`Sidecar` (its checkout and a Containerfile) and uses it in `prepare()` (setup
+steps run in the project) and/or `interceptor()` (a proxy inserted before the
+recording proxy).
 
 ## Running
 
@@ -165,6 +200,7 @@ uv run pytest                                   # everything
 uv run pytest --subject bare --case monitor     # a single case
 REDACTED_BIN=~/git/redacted/redacted uv run pytest --subject redacted
 REDACTED_PR47_BIN=~/git/redacted-pr47/target/release/redacted uv run pytest --subject redacted-pr47 --subject redacted-pr47-heuristic
+RDX_SRC=~/git/claude-code-redact uv run pytest --subject rdx-proxy
 uv run pytest --model claude-sonnet-5           # another model (default: Haiku 4.5)
 uv run pytest --claude-version 2.1.292          # another Claude Code version (podman)
 uv run pytest --sandbox host                    # no container
@@ -179,7 +215,8 @@ report; in host mode, leaves the sessions in `~/.claude/projects`).
 
 At the end of a run, a case × subject matrix is printed. It is written, along
 with all the evidence, to `reports/<timestamp>/<sandbox>/`: `stream.jsonl`,
-`wire.txt` (request bodies), `transcript.jsonl`, `settings.json`.
+`wire.txt` (request bodies), `transcript.jsonl`, `settings.json` and, for an
+interceptor, `interceptor.log`.
 
 ## Caveats
 
@@ -192,4 +229,6 @@ with all the evidence, to `reports/<timestamp>/<sandbox>/`: `stream.jsonl`,
   (telemetry…) is blocked. The bench therefore measures what Claude Code sends
   to the API, not what it would try to send elsewhere.
 - In host mode, the rest of the traffic is neither blocked nor recorded, and a
-  filter may read its global config (`~/.config/redacted/…`).
+  filter may read its global config (`~/.config/redacted/…`). The `rdx-proxy`
+  interceptor runs from its checkout with `uv run`, which creates a `.venv`
+  there.

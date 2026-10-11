@@ -5,6 +5,9 @@ Two sandboxes:
   network with no egress and a dummy credential. A proxy container is the
   only way out; it records every request and swaps in the real credential.
 - HostSandbox: Claude Code on the host, behind an in-process recording proxy.
+
+A subject's interceptor (a redacting proxy) sits between Claude Code and the
+recording proxy, so what is recorded is what the interceptor let through.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -20,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .proxy import RecordingProxy
+from .subjects import Interceptor, Sidecar
 
 CLAUDE_BIN = os.environ.get("BENCH_CLAUDE_BIN", "claude")
 ROOT = Path(__file__).resolve().parent.parent
@@ -104,18 +109,29 @@ class HostSandbox:
         config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
         self.projects = config_dir / "projects"
 
+    def exec(self, sidecar: Sidecar, argv: list[str], project: Path) -> None:
+        subprocess.run([*sidecar.host_cmd, *argv], cwd=project, check=True, capture_output=True,
+                       env=clean_env(), timeout=300)
+
     def run(self, prompt, *, session_id, model, project, settings, subject_files, env, artifacts, timeout,
-            keep_transcripts) -> RawRun:
+            keep_transcripts, interceptor: Interceptor | None = None) -> RawRun:
         settings_path = artifacts / "settings.json"
         settings_path.write_text(json.dumps(settings, indent=2))
         proxy = RecordingProxy().start()
+        sidecar = None
         try:
+            base_url = proxy.base_url
+            if interceptor:
+                sidecar, base_url = self._start_interceptor(interceptor, proxy.base_url, project, artifacts)
             proc = subprocess.run(
                 [CLAUDE_BIN, *claude_args(prompt, session_id, model, str(settings_path))],
                 cwd=project, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
-                env=clean_env({"ANTHROPIC_BASE_URL": proxy.base_url, **env}),
+                env=clean_env({"ANTHROPIC_BASE_URL": base_url, **env}),
             )
         finally:
+            if sidecar:
+                sidecar.terminate()
+                sidecar.wait(timeout=10)
             proxy.stop()
         paths = list(self.projects.glob(f"*/{session_id}*"))
         transcript = "\n".join(_read_tree(p) if p.is_dir() else p.read_text(errors="replace") for p in paths)
@@ -123,6 +139,28 @@ class HostSandbox:
             for p in paths:
                 shutil.rmtree(p) if p.is_dir() else p.unlink()
         return RawRun(proc.returncode, proc.stdout, proc.stderr, proxy.wire_text(), transcript)
+
+    @staticmethod
+    def _start_interceptor(icp: Interceptor, upstream: str, project: Path,
+                           artifacts: Path) -> tuple[subprocess.Popen, str]:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        argv = [a.format(host="127.0.0.1", port=port) for a in icp.argv]
+        proc = subprocess.Popen([*icp.sidecar.host_cmd, *argv], cwd=project, stdin=subprocess.DEVNULL,
+                                stdout=(artifacts / "interceptor.log").open("w"), stderr=subprocess.STDOUT,
+                                env=clean_env({icp.upstream_env: upstream}))
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"interceptor exited: {(artifacts / 'interceptor.log').read_text()[-2000:]}")
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                return proc, f"http://127.0.0.1:{port}"
+            except OSError:
+                time.sleep(0.2)
+        proc.kill()
+        raise RuntimeError("interceptor did not start listening")
 
     def close(self) -> None:
         pass
@@ -202,18 +240,31 @@ class PodmanSandbox:
         self.auth_file.touch(mode=0o600)
         self.auth_file.write_text(auth)
 
-    def _build(self, tag: str, containerfile: str, **build_args: str) -> None:
+    def _build(self, tag: str, containerfile: str, context: Path = ROOT, **build_args: str) -> None:
         if _podman("image", "exists", tag, check=False).returncode == 0:
             return
         args = [f"--build-arg={k}={v}" for k, v in build_args.items()]
-        _podman("build", "-q", "-f", str(ROOT / "containers" / containerfile), *args, "-t", tag, str(ROOT),
+        _podman("build", "-q", "-f", str(ROOT / "containers" / containerfile), *args, "-t", tag, str(context),
                 timeout=1200)
+
+    def _sidecar_image(self, sidecar: Sidecar) -> str:
+        image = f"leak-bench-{sidecar.name}:{sidecar.tag}"
+        self._build(image, sidecar.containerfile, context=sidecar.checkout)
+        return image
+
+    def _sidecar_args(self) -> list[str]:
+        return [f"--userns=keep-id:uid={self.UID},gid={self.UID}", "--network", self.INTERNAL,
+                "--cap-drop=all", "--security-opt=no-new-privileges", "--read-only", "--tmpfs", "/tmp:rw,U"]
+
+    def exec(self, sidecar: Sidecar, argv: list[str], project: Path) -> None:
+        _podman("run", "--rm", *self._sidecar_args(), "-v", f"{project}:/work:z", "-w", "/work",
+                self._sidecar_image(sidecar), *argv, timeout=300)
 
     def close(self) -> None:
         shutil.rmtree(self._secret_dir, ignore_errors=True)
 
     def run(self, prompt, *, session_id, model, project, settings, subject_files, env, artifacts, timeout,
-            keep_transcripts) -> RawRun:
+            keep_transcripts, interceptor: Interceptor | None = None) -> RawRun:
         work = Path(tempfile.mkdtemp(prefix="lb-", dir=artifacts.parent))
         config, records, staged = work / "claude-config", work / "records", work / "subject"
         for d in (config, records, staged):
@@ -226,24 +277,34 @@ class PodmanSandbox:
         shutil.copy2(staged / "settings.json", artifacts / "settings.json")
 
         tag = session_id[:8]
-        proxy_name, claude_name = f"lb-proxy-{tag}", f"lb-claude-{tag}"
+        proxy_name, claude_name, icp_name = f"lb-proxy-{tag}", f"lb-claude-{tag}", f"lb-icp-{tag}"
         userns = f"--userns=keep-id:uid={self.UID},gid={self.UID}"
         _podman("run", "-d", "--rm", "--init", "--name", proxy_name, userns,
                 "--network", f"{self.INTERNAL},{self.EGRESS}",
                 "--cap-drop=all", "--security-opt=no-new-privileges", "--read-only",
                 "-v", f"{self.auth_file}:/run/secrets/bench-auth:ro,z",
                 "-v", f"{records}:/records:Z", self.PROXY_IMAGE)
+        base_url = f"http://{proxy_name}:8080"
         try:
-            self._wait_ready(proxy_name)
+            self._wait_ready(proxy_name, "listening")
+            if interceptor:
+                argv = [a.format(host="0.0.0.0", port=8080) for a in interceptor.argv]
+                # Same project path as Claude Code: it may locate the project from the system prompt.
+                _podman("run", "-d", "--rm", "--init", "--name", icp_name, *self._sidecar_args(),
+                        "-v", f"{project}:/work:ro,z", "-w", "/work",
+                        "-e", f"{interceptor.upstream_env}={base_url}",
+                        self._sidecar_image(interceptor.sidecar), *argv)
+                self._wait_ready(icp_name, interceptor.ready)
+                base_url = f"http://{icp_name}:8080"
             cmd = ["podman", "run", "--rm", "-i", "--name", claude_name, userns,
                    "--network", self.INTERNAL,
                    "--cap-drop=all", "--security-opt=no-new-privileges", "--read-only",
                    "--pids-limit=1024", "--memory=4g",
                    "--tmpfs", "/tmp:rw,U", "--tmpfs", "/home/bench:rw,U",
                    "-v", f"{config}:/home/bench/.claude:Z",
-                   "-v", f"{project}:/work:Z",
+                   "-v", f"{project}:/work:z",
                    "-v", f"{staged}:{self.subject_dir}:ro,Z",
-                   "-e", f"ANTHROPIC_BASE_URL=http://{proxy_name}:8080"]
+                   "-e", f"ANTHROPIC_BASE_URL={base_url}"]
             for k, v in {**self.dummy_env, **env}.items():
                 cmd += ["-e", f"{k}={v}"]
             cmd += [self.claude_image, *claude_args(prompt, session_id, model, f"{self.subject_dir}/settings.json")]
@@ -254,6 +315,10 @@ class PodmanSandbox:
                 _podman("kill", claude_name, check=False)
                 raise
         finally:
+            if interceptor:
+                logs = _podman("logs", icp_name, check=False)
+                (artifacts / "interceptor.log").write_text(logs.stdout + logs.stderr)
+                _podman("kill", icp_name, check=False)
             _podman("kill", proxy_name, check=False)
 
         wire_file = records / "wire.jsonl"
@@ -266,23 +331,24 @@ class PodmanSandbox:
         return RawRun(proc.returncode, proc.stdout, proc.stderr, wire, transcript)
 
     @staticmethod
-    def _wait_ready(name: str, timeout: float = 20) -> None:
+    def _wait_ready(name: str, line: str, timeout: float = 20) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if "listening" in _podman("logs", name, check=False).stdout:
+            logs = _podman("logs", name, check=False)
+            if line in logs.stdout + logs.stderr:
                 return
             time.sleep(0.2)
-        raise RuntimeError(f"proxy container {name} did not start: {_podman('logs', name, check=False).stderr}")
+        raise RuntimeError(f"container {name} did not start: {_podman('logs', name, check=False).stderr}")
 
 
 def run_claude(prompt: str, *, sandbox, project: Path, settings: dict, subject_files: dict[str, Path],
                artifacts: Path, model: str, env: dict[str, str] | None = None, timeout: int = 600,
-               keep_transcripts: bool = False) -> Run:
+               keep_transcripts: bool = False, interceptor: Interceptor | None = None) -> Run:
     artifacts.mkdir(parents=True, exist_ok=True)
     session_id = str(uuid.uuid4())
     raw = sandbox.run(prompt, session_id=session_id, model=model, project=project, settings=settings,
                       subject_files=subject_files, env=env or {}, artifacts=artifacts, timeout=timeout,
-                      keep_transcripts=keep_transcripts)
+                      keep_transcripts=keep_transcripts, interceptor=interceptor)
 
     events = []
     for line in raw.stdout.splitlines():
